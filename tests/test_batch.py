@@ -371,9 +371,9 @@ class TestCache:
         def fail_transport(url, json=None, headers=None, timeout=None):
             raise AssertionError("transport must not be called on cache hit")
 
-        os.remove(os.path.join(out_dir, "dataset.jsonl"))
         rc = BatchCollector(
-            spec=spec, out_dir=out_dir, transport_fn=fail_transport, sleep_fn=lambda _: None
+            spec=spec, out_dir=out_dir, fresh=True,
+            transport_fn=fail_transport, sleep_fn=lambda _: None,
         ).run()
         assert rc == 0
         dataset = read_jsonl(os.path.join(out_dir, "dataset.jsonl"))
@@ -393,13 +393,130 @@ class TestCache:
         ).run()
         assert rc == 0
 
-        os.remove(os.path.join(out_dir, "dataset.jsonl"))
         rc = BatchCollector(
-            spec=spec, out_dir=out_dir, refresh=True,
+            spec=spec, out_dir=out_dir, fresh=True, refresh=True,
             transport_fn=transport, sleep_fn=lambda _: None,
         ).run()
         assert rc == 0
         assert len(transport.calls) == 4
+
+
+def paged_transport():
+    """Transport serving three america pages and one uk page."""
+    transport = FakeTransport()
+    transport.add_page("america", 0, FakeResponse(200, {
+        "data": [
+            {"s": "NYSE:A", "d": ["A", 1.0, 0.1, 100, 1e6]},
+            {"s": "NYSE:B", "d": ["B", 2.0, 0.2, 200, 2e6]},
+        ],
+        "totalCount": 5,
+    }))
+    transport.add_page("america", 2, FakeResponse(200, {
+        "data": [
+            {"s": "NYSE:C", "d": ["C", 3.0, 0.3, 300, 3e6]},
+            {"s": "NYSE:D", "d": ["D", 4.0, 0.4, 400, 4e6]},
+        ],
+        "totalCount": 5,
+    }))
+    transport.add_page("america", 4, FakeResponse(200, {
+        "data": [{"s": "NYSE:E", "d": ["E", 5.0, 0.5, 500, 5e6]}],
+        "totalCount": 5,
+    }))
+    transport.add_page("uk", 0, FakeResponse(200, {
+        "data": [{"s": "LSE:U", "d": ["U", 9.0, 0.9, 900, 9e6]}],
+        "totalCount": 1,
+    }))
+    return transport
+
+
+class TestCheckpoint:
+    def test_resume_after_crash_matches_single_run(self, tmp_path):
+        spec = BatchSpec.from_dict(make_spec_dict(max_rows=10))
+
+        # Reference: one uninterrupted run.
+        out_ref = str(tmp_path / "out_ref")
+        rc = BatchCollector(
+            spec=spec, out_dir=out_ref,
+            transport_fn=paged_transport(), sleep_fn=lambda _: None,
+        ).run()
+        assert rc == 0
+
+        # Crashed run: america's second page fails non-retryably.
+        out_resumed = str(tmp_path / "out_resumed")
+        crashed = paged_transport()
+        crashed.pages[("america", 2)] = [FakeResponse(400, text="bad request")]
+        rc = BatchCollector(
+            spec=spec, out_dir=out_resumed,
+            transport_fn=crashed, sleep_fn=lambda _: None,
+        ).run()
+        assert rc == 2
+
+        # Resume: only the missing pages may be fetched.
+        resumed = paged_transport()
+        rc = BatchCollector(
+            spec=spec, out_dir=out_resumed,
+            transport_fn=resumed, sleep_fn=lambda _: None,
+        ).run()
+        assert rc == 0
+        assert ("america", 0) not in resumed.calls
+        assert ("uk", 0) not in resumed.calls
+        assert resumed.calls == [("america", 2), ("america", 4)]
+
+        with open(os.path.join(out_ref, "dataset.jsonl"), "rb") as fh:
+            reference = fh.read()
+        with open(os.path.join(out_resumed, "dataset.jsonl"), "rb") as fh:
+            resumed_bytes = fh.read()
+        assert resumed_bytes == reference
+
+        manifest = json.loads(
+            open(os.path.join(out_resumed, "manifest.json"), encoding="utf-8").read()
+        )
+        assert manifest["markets"]["america"]["status"] == "success"
+        assert manifest["markets"]["america"]["pages_fetched"] == 3
+
+    def test_rerun_after_success_is_byte_identical(self, tmp_path):
+        spec = BatchSpec.from_dict(make_spec_dict(max_rows=10))
+        out_dir = str(tmp_path / "out")
+        rc = BatchCollector(
+            spec=spec, out_dir=out_dir,
+            transport_fn=paged_transport(), sleep_fn=lambda _: None,
+        ).run()
+        assert rc == 0
+        dataset_path = os.path.join(out_dir, "dataset.jsonl")
+        with open(dataset_path, "rb") as fh:
+            first = fh.read()
+
+        def fail_transport(url, json=None, headers=None, timeout=None):
+            raise AssertionError("no requests expected on completed checkpoint")
+
+        rc = BatchCollector(
+            spec=spec, out_dir=out_dir,
+            transport_fn=fail_transport, sleep_fn=lambda _: None,
+        ).run()
+        assert rc == 0
+        with open(dataset_path, "rb") as fh:
+            assert fh.read() == first
+
+    def test_fresh_discards_checkpoint(self, tmp_path):
+        spec = BatchSpec.from_dict(make_spec_dict(max_rows=10))
+        out_dir = str(tmp_path / "out")
+        rc = BatchCollector(
+            spec=spec, out_dir=out_dir,
+            transport_fn=paged_transport(), sleep_fn=lambda _: None,
+        ).run()
+        assert rc == 0
+
+        transport = paged_transport()
+        rc = BatchCollector(
+            spec=spec, out_dir=out_dir, fresh=True, refresh=True,
+            transport_fn=transport, sleep_fn=lambda _: None,
+        ).run()
+        assert rc == 0
+        assert len(transport.calls) == 4
+        dataset = read_jsonl(os.path.join(out_dir, "dataset.jsonl"))
+        assert [r["symbol"] for r in dataset] == [
+            "NYSE:A", "NYSE:B", "NYSE:C", "NYSE:D", "NYSE:E", "LSE:U",
+        ]
 
     def test_expired_cache_refetches(self, tmp_path):
         transport = FakeTransport()
@@ -416,9 +533,8 @@ class TestCache:
         ).run()
         assert rc == 0
 
-        os.remove(os.path.join(out_dir, "dataset.jsonl"))
         rc = BatchCollector(
-            spec=spec, out_dir=out_dir, transport_fn=transport,
+            spec=spec, out_dir=out_dir, fresh=True, transport_fn=transport,
             sleep_fn=lambda _: None, cache_ttl_seconds=0,
         ).run()
         assert rc == 0

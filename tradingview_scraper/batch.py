@@ -104,6 +104,20 @@ class BatchSpec:
             requests_per_second=float(rps),
         )
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "markets": list(self.markets),
+            "columns": list(self.columns),
+            "filters": self.filters,
+            "page_size": self.page_size,
+            "max_rows": self.max_rows,
+            "requests_per_second": self.requests_per_second,
+        }
+
+    def fingerprint(self) -> str:
+        raw = json.dumps(self.to_dict(), sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
 
 def load_spec(path: str) -> BatchSpec:
     """Load and validate a batch spec from a JSON file."""
@@ -138,17 +152,30 @@ class BatchCollector:
         self.sleep_fn = sleep_fn
         self.cache_ttl_seconds = cache_ttl_seconds
         self.headers = {"User-Agent": generate_user_agent()}
+        self._checkpoint: Dict[str, Any] = {"markets": {}}
 
     def run(self) -> int:
         """Run the batch job and return the process exit code."""
         os.makedirs(self.out_dir, exist_ok=True)
         http_transport.configure_rate_limit(self.spec.requests_per_second)
 
+        if self.fresh:
+            self._reset_outputs()
+        self._checkpoint = self._load_checkpoint()
+
         results = {}
         for market in self.spec.markets:
+            previous = self._checkpoint["markets"].get(market)
+            if previous and previous.get("status") == "success":
+                logger.info("market %s already complete, skipping", market)
+                results[market] = previous
+                continue
             logger.info("collecting market %s", market)
-            results[market] = self._collect_market(market)
+            results[market] = self._collect_market(market, previous)
+            self._checkpoint["markets"][market] = results[market]
+            self._save_checkpoint()
 
+        self._assemble_outputs()
         self._write_manifest(results)
         if not self._verify_counts(results):
             return 1
@@ -160,9 +187,11 @@ class BatchCollector:
             return 2
         return 1
 
-    def _collect_market(self, market: str) -> Dict[str, Any]:
+    def _collect_market(
+        self, market: str, previous: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """Fetch all pages for one market, writing rows as pages complete."""
-        state = {
+        state = previous or {
             "status": "in_progress",
             "pages_fetched": 0,
             "received": 0,
@@ -170,10 +199,14 @@ class BatchCollector:
             "quarantined": 0,
             "skipped": 0,
             "last_error": None,
+            "next_offset": 0,
         }
-        seen = set()
-        offset = 0
-        dataset_path = os.path.join(self.out_dir, "dataset.jsonl")
+        state["status"] = "in_progress"
+        state["last_error"] = None
+        seen = self._load_seen_symbols(market) if state["next_offset"] else set()
+        offset = state["next_offset"]
+        dataset_path = self._part_path(market, "dataset")
+        os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
 
         with open(dataset_path, "a", encoding="utf-8") as dataset_fh:
             while offset < self.spec.max_rows:
@@ -212,6 +245,9 @@ class BatchCollector:
                 dataset_fh.flush()
 
                 offset = page_end
+                state["next_offset"] = offset
+                self._checkpoint["markets"][market] = state
+                self._save_checkpoint()
                 if new_symbols == 0:
                     break
                 if total_count is not None and offset >= total_count:
@@ -351,6 +387,84 @@ class BatchCollector:
             return 0
         with open(path, "r", encoding="utf-8") as fh:
             return sum(1 for _ in fh)
+
+    def _checkpoint_path(self) -> str:
+        return os.path.join(self.out_dir, "checkpoint.json")
+
+    def _load_checkpoint(self) -> Dict[str, Any]:
+        try:
+            with open(self._checkpoint_path(), "r", encoding="utf-8") as fh:
+                checkpoint = json.load(fh)
+        except (OSError, ValueError):
+            return {"spec_hash": self.spec.fingerprint(), "markets": {}}
+        if checkpoint.get("spec_hash") != self.spec.fingerprint():
+            logger.warning("spec changed since last run, starting over")
+            self._reset_outputs()
+            return {"spec_hash": self.spec.fingerprint(), "markets": {}}
+        checkpoint.setdefault("markets", {})
+        return checkpoint
+
+    def _save_checkpoint(self) -> None:
+        with open(self._checkpoint_path(), "w", encoding="utf-8") as fh:
+            json.dump(self._checkpoint, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+    def _reset_outputs(self) -> None:
+        for name in ("dataset.jsonl", "quarantine.jsonl", "checkpoint.json"):
+            try:
+                os.remove(os.path.join(self.out_dir, name))
+            except OSError:
+                pass
+        parts_dir = os.path.join(self.out_dir, ".parts")
+        if os.path.isdir(parts_dir):
+            for entry in os.listdir(parts_dir):
+                try:
+                    os.remove(os.path.join(parts_dir, entry))
+                except OSError:
+                    pass
+
+    def _part_path(self, market: str, kind: str) -> str:
+        return os.path.join(self.out_dir, ".parts", f"{market}.{kind}.jsonl")
+
+    def _assemble_outputs(self) -> None:
+        """Concatenate per-market part files into the final jsonl outputs."""
+        for kind, target in (("dataset", "dataset.jsonl"),
+                             ("quarantine", "quarantine.jsonl")):
+            lines = []
+            for market in self.spec.markets:
+                part = self._part_path(market, kind)
+                if not os.path.exists(part):
+                    continue
+                with open(part, "r", encoding="utf-8") as fh:
+                    lines.extend(fh.readlines())
+            target_path = os.path.join(self.out_dir, target)
+            if not lines:
+                if os.path.exists(target_path):
+                    os.remove(target_path)
+                continue
+            tmp_path = target_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                fh.writelines(lines)
+            os.replace(tmp_path, target_path)
+
+    def _load_seen_symbols(self, market: str) -> set:
+        """Rebuild the dedup set for a market from rows already on disk."""
+        seen = set()
+        for kind in ("dataset", "quarantine"):
+            path = self._part_path(market, kind)
+            if not os.path.exists(path):
+                continue
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue
+                    seen.add(record.get("symbol") or "")
+        return seen
 
 
 def build_parser() -> argparse.ArgumentParser:
