@@ -3,6 +3,7 @@ import os
 import sys
 
 import pytest
+import requests
 
 # Add the current working directory to the system path
 path = str(os.getcwd())
@@ -17,6 +18,7 @@ from tradingview_scraper.batch import (
     main,
 )
 from tradingview_scraper.symbols import http_transport
+from tradingview_scraper.symbols.screener import Screener
 
 
 def make_spec_dict(**overrides):
@@ -130,3 +132,222 @@ class TestRateLimiter:
         limiter.wait("https://scanner.tradingview.com/america/scan")
         limiter.wait("https://scanner.tradingview.com/america/scan")
         assert sleeps == []
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None, headers=None, text=""):
+        self.status_code = status_code
+        self._payload = payload
+        self.headers = headers or {}
+        self.text = text
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+def make_rows(symbols):
+    return {
+        "data": [
+            {"s": symbol, "d": [symbol, 100.0, 1.5, 5000, 1e9]}
+            for symbol in symbols
+        ],
+        "totalCount": len(symbols),
+    }
+
+
+class FakeTransport:
+    """Scripted scanner transport keyed by (market, range_start)."""
+
+    def __init__(self):
+        self.pages = {}
+        self.calls = []
+
+    def add_page(self, market, start, response):
+        self.pages.setdefault((market, start), []).append(response)
+
+    def __call__(self, url, json=None, headers=None, timeout=None):
+        market = next(
+            name for name, u in Screener.SUPPORTED_MARKETS.items() if u == url
+        )
+        start = json["range"][0]
+        self.calls.append((market, start))
+        queue = self.pages[(market, start)]
+        if len(queue) > 1:
+            return queue.pop(0)
+        return queue[0]
+
+
+def run_collector(tmp_path, transport, **spec_overrides):
+    spec = BatchSpec.from_dict(make_spec_dict(**spec_overrides))
+    out_dir = str(tmp_path / "out")
+    collector = BatchCollector(
+        spec=spec,
+        out_dir=out_dir,
+        transport_fn=transport,
+        sleep_fn=lambda _: None,
+    )
+    rc = collector.run()
+    return rc, out_dir
+
+
+def read_jsonl(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+class TestCollection:
+    def test_pagination_and_duplicate_skip(self, tmp_path):
+        transport = FakeTransport()
+        transport.add_page("america", 0, FakeResponse(200, {
+            "data": [
+                {"s": "NYSE:A", "d": ["A", 1.0, 0.1, 100, 1e6]},
+                {"s": "NYSE:B", "d": ["B", 2.0, 0.2, 200, 2e6]},
+            ],
+            "totalCount": 5,
+        }))
+        transport.add_page("america", 2, FakeResponse(200, {
+            "data": [
+                {"s": "NYSE:B", "d": ["B", 2.0, 0.2, 200, 2e6]},
+                {"s": "NYSE:C", "d": ["C", 3.0, 0.3, 300, 3e6]},
+            ],
+            "totalCount": 5,
+        }))
+        transport.add_page("america", 4, FakeResponse(200, {
+            "data": [
+                {"s": "NYSE:D", "d": ["D", 4.0, 0.4, 400, 4e6]},
+            ],
+            "totalCount": 5,
+        }))
+        transport.add_page("uk", 0, FakeResponse(200, {
+            "data": [{"s": "LSE:U", "d": ["U", 9.0, 0.9, 900, 9e6]}],
+            "totalCount": 1,
+        }))
+
+        rc, out_dir = run_collector(tmp_path, transport)
+        assert rc == 0
+
+        dataset = read_jsonl(os.path.join(out_dir, "dataset.jsonl"))
+        assert [r["symbol"] for r in dataset] == [
+            "NYSE:A", "NYSE:B", "NYSE:C", "NYSE:D", "LSE:U",
+        ]
+        assert dataset[0]["market"] == "america"
+        assert dataset[0]["name"] == "A"
+        assert dataset[0]["close"] == 1.0
+
+        manifest = json.loads(
+            open(os.path.join(out_dir, "manifest.json"), encoding="utf-8").read()
+        )
+        america = manifest["markets"]["america"]
+        assert america["status"] == "success"
+        assert america["pages_fetched"] == 3
+        assert america["written"] == 4
+        assert america["skipped"] == 1
+        assert america["received"] == 5
+        assert america["last_error"] is None
+        assert manifest["markets"]["uk"]["written"] == 1
+
+    def test_stops_on_empty_page(self, tmp_path):
+        transport = FakeTransport()
+        transport.add_page("america", 0, FakeResponse(200, make_rows(["S1", "S2"])))
+        transport.add_page("america", 2, FakeResponse(200, {"data": [], "totalCount": 100}))
+        transport.add_page("uk", 0, FakeResponse(200, make_rows(["U1"])))
+
+        rc, out_dir = run_collector(tmp_path, transport, max_rows=10)
+        assert rc == 0
+        assert (("america", 4) not in transport.calls)
+        manifest = json.loads(
+            open(os.path.join(out_dir, "manifest.json"), encoding="utf-8").read()
+        )
+        assert manifest["markets"]["america"]["status"] == "success"
+
+    def test_max_rows_caps_collection(self, tmp_path):
+        transport = FakeTransport()
+        transport.add_page("america", 0, FakeResponse(200, make_rows(["S1", "S2"])))
+        transport.add_page("uk", 0, FakeResponse(200, make_rows(["U1"])))
+
+        rc, out_dir = run_collector(tmp_path, transport, max_rows=2)
+        assert rc == 0
+        dataset = read_jsonl(os.path.join(out_dir, "dataset.jsonl"))
+        assert [r["symbol"] for r in dataset] == ["S1", "S2", "U1"]
+
+    def test_429_retry_after_then_success(self, tmp_path):
+        sleeps = []
+        transport = FakeTransport()
+        transport.add_page("america", 0, FakeResponse(429, headers={"Retry-After": "7"}))
+        transport.add_page("america", 0, FakeResponse(200, make_rows(["S1"])))
+        transport.add_page("uk", 0, FakeResponse(200, make_rows(["U1"])))
+
+        spec = BatchSpec.from_dict(make_spec_dict(max_rows=5))
+        collector = BatchCollector(
+            spec=spec,
+            out_dir=str(tmp_path / "out"),
+            transport_fn=transport,
+            sleep_fn=sleeps.append,
+        )
+        rc = collector.run()
+        assert rc == 0
+        assert sleeps == [7.0]
+        dataset = read_jsonl(os.path.join(str(tmp_path / "out"), "dataset.jsonl"))
+        assert [r["symbol"] for r in dataset] == ["S1", "U1"]
+
+    def test_retry_exhaustion_fails_single_market(self, tmp_path):
+        transport = FakeTransport()
+        for _ in range(5):
+            transport.add_page("america", 0, FakeResponse(500, text="boom"))
+        transport.add_page("uk", 0, FakeResponse(200, make_rows(["U1"])))
+
+        rc, out_dir = run_collector(tmp_path, transport)
+        assert rc == 2
+
+        manifest = json.loads(
+            open(os.path.join(out_dir, "manifest.json"), encoding="utf-8").read()
+        )
+        assert manifest["markets"]["america"]["status"] == "failed"
+        assert "500" in manifest["markets"]["america"]["last_error"]
+        assert manifest["markets"]["uk"]["status"] == "success"
+
+        dataset = read_jsonl(os.path.join(out_dir, "dataset.jsonl"))
+        assert [r["symbol"] for r in dataset] == ["U1"]
+
+    def test_all_markets_failed_returns_1(self, tmp_path):
+        transport = FakeTransport()
+        for _ in range(5):
+            transport.add_page("america", 0, FakeResponse(500))
+            transport.add_page("uk", 0, FakeResponse(500))
+
+        rc, out_dir = run_collector(tmp_path, transport)
+        assert rc == 1
+
+    def test_connection_error_retried(self, tmp_path):
+        calls = []
+
+        def flaky_transport(url, json=None, headers=None, timeout=None):
+            calls.append(url)
+            if len(calls) == 1:
+                raise requests.ConnectionError("reset by peer")
+            if "uk" in url:
+                return FakeResponse(200, make_rows(["U1"]))
+            return FakeResponse(200, make_rows(["S1"]))
+
+        rc, out_dir = run_collector(tmp_path, flaky_transport, max_rows=5)
+        assert rc == 0
+        assert len(calls) == 3
+
+    def test_read_timeout_retried(self, tmp_path):
+        calls = []
+
+        def flaky_transport(url, json=None, headers=None, timeout=None):
+            calls.append(url)
+            if len(calls) == 1:
+                raise requests.ReadTimeout("timed out")
+            if "uk" in url:
+                return FakeResponse(200, make_rows(["U1"]))
+            return FakeResponse(200, make_rows(["S1"]))
+
+        rc, out_dir = run_collector(tmp_path, flaky_transport, max_rows=5)
+        assert rc == 0
+        assert len(calls) == 3

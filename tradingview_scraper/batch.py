@@ -19,8 +19,10 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
+
+import requests
 
 from tradingview_scraper.symbols import http_transport
 from tradingview_scraper.symbols.screener import Screener
@@ -34,10 +36,15 @@ DEFAULT_MAX_ROWS = 1000
 DEFAULT_REQUESTS_PER_SECOND = 1.0
 DEFAULT_CACHE_TTL_SECONDS = 30 * 60
 REQUEST_TIMEOUT_SECONDS = 30
+MAX_PAGE_ATTEMPTS = 5
 
 
 class SpecError(ValueError):
     """Raised when the batch spec file is invalid."""
+
+
+class PageFetchError(RuntimeError):
+    """Raised when a page cannot be fetched after all retries."""
 
 
 @dataclass
@@ -131,7 +138,180 @@ class BatchCollector:
 
     def run(self) -> int:
         """Run the batch job and return the process exit code."""
-        raise NotImplementedError
+        os.makedirs(self.out_dir, exist_ok=True)
+        http_transport.configure_rate_limit(self.spec.requests_per_second)
+
+        results = {}
+        for market in self.spec.markets:
+            logger.info("collecting market %s", market)
+            results[market] = self._collect_market(market)
+
+        self._write_manifest(results)
+        if not self._verify_counts(results):
+            return 1
+
+        statuses = [state["status"] for state in results.values()]
+        if all(status == "success" for status in statuses):
+            return 0
+        if any(status == "success" for status in statuses):
+            return 2
+        return 1
+
+    def _collect_market(self, market: str) -> Dict[str, Any]:
+        """Fetch all pages for one market, writing rows as pages complete."""
+        state = {
+            "status": "in_progress",
+            "pages_fetched": 0,
+            "received": 0,
+            "written": 0,
+            "quarantined": 0,
+            "skipped": 0,
+            "last_error": None,
+        }
+        seen = set()
+        offset = 0
+        dataset_path = os.path.join(self.out_dir, "dataset.jsonl")
+
+        with open(dataset_path, "a", encoding="utf-8") as dataset_fh:
+            while offset < self.spec.max_rows:
+                page_end = min(offset + self.spec.page_size, self.spec.max_rows)
+                payload = self._build_payload(offset, page_end)
+                try:
+                    response = self._fetch_page(market, payload)
+                except PageFetchError as exc:
+                    state["status"] = "failed"
+                    state["last_error"] = str(exc)
+                    logger.error("market %s failed at offset %d: %s", market, offset, exc)
+                    break
+
+                rows = response.get("data") or []
+                total_count = response.get("totalCount")
+                state["pages_fetched"] += 1
+
+                if not rows:
+                    break
+
+                new_symbols = 0
+                for item in rows:
+                    state["received"] += 1
+                    symbol = item.get("s") or ""
+                    if symbol in seen:
+                        state["skipped"] += 1
+                        continue
+                    seen.add(symbol)
+                    new_symbols += 1
+                    record = {"market": market, "symbol": symbol}
+                    values = item.get("d") or []
+                    for idx, column in enumerate(self.spec.columns):
+                        record[column] = values[idx] if idx < len(values) else None
+                    dataset_fh.write(json.dumps(record) + "\n")
+                    state["written"] += 1
+                dataset_fh.flush()
+
+                offset = page_end
+                if new_symbols == 0:
+                    break
+                if total_count is not None and offset >= total_count:
+                    break
+
+        if state["status"] == "in_progress":
+            state["status"] = "success"
+        return state
+
+    def _build_payload(self, start: int, end: int) -> Dict[str, Any]:
+        payload = {
+            "columns": list(self.spec.columns),
+            "options": {"lang": "en"},
+            "range": [start, end],
+        }
+        if self.spec.filters:
+            payload["filter"] = self.spec.filters
+        return payload
+
+    def _fetch_page(self, market: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Fetch a single page with retries; raises PageFetchError on exhaustion."""
+        url = Screener.SUPPORTED_MARKETS[market]
+        last_error = "unknown error"
+        for attempt in range(MAX_PAGE_ATTEMPTS):
+            try:
+                response = self.transport_fn(
+                    url,
+                    json=payload,
+                    headers=self.headers,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+            except (requests.ReadTimeout, requests.ConnectionError) as exc:
+                last_error = f"request error: {exc}"
+                logger.warning("page fetch attempt %d failed: %s", attempt + 1, exc)
+                self._backoff(attempt)
+                continue
+
+            status = response.status_code
+            if status == 200:
+                try:
+                    return response.json()
+                except ValueError as exc:
+                    last_error = f"invalid JSON response: {exc}"
+                    self._backoff(attempt)
+                    continue
+            if status == 429:
+                last_error = "HTTP 429 (rate limited)"
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after) if retry_after is not None else None
+                except (TypeError, ValueError):
+                    wait = None
+                logger.warning("rate limited on %s", market)
+                self._backoff(attempt, wait)
+                continue
+            if 500 <= status < 600:
+                last_error = f"HTTP {status}"
+                logger.warning("server error %d on %s, retrying", status, market)
+                self._backoff(attempt)
+                continue
+            raise PageFetchError(f"HTTP {status}: {getattr(response, 'text', '')}")
+
+        raise PageFetchError(f"exhausted {MAX_PAGE_ATTEMPTS} attempts: {last_error}")
+
+    def _backoff(self, attempt: int, wait: Optional[float] = None) -> None:
+        if wait is None:
+            wait = min(2 ** attempt, 8)
+        self.sleep_fn(wait)
+
+    def _write_manifest(self, results: Dict[str, Dict[str, Any]]) -> None:
+        manifest = {"markets": results}
+        manifest_path = os.path.join(self.out_dir, "manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+
+    def _verify_counts(self, results: Dict[str, Dict[str, Any]]) -> bool:
+        """Check that per-market counters and jsonl line counts agree."""
+        ok = True
+        for market, state in results.items():
+            total = state["written"] + state["quarantined"] + state["skipped"]
+            if total != state["received"]:
+                logger.error(
+                    "count mismatch for %s: received=%d but written+quarantined+skipped=%d",
+                    market, state["received"], total,
+                )
+                ok = False
+        expected_dataset = sum(s["written"] for s in results.values())
+        expected_quarantine = sum(s["quarantined"] for s in results.values())
+        if self._count_lines("dataset.jsonl") != expected_dataset:
+            logger.error("dataset.jsonl line count mismatch")
+            ok = False
+        if self._count_lines("quarantine.jsonl") != expected_quarantine:
+            logger.error("quarantine.jsonl line count mismatch")
+            ok = False
+        return ok
+
+    def _count_lines(self, name: str) -> int:
+        path = os.path.join(self.out_dir, name)
+        if not os.path.exists(path):
+            return 0
+        with open(path, "r", encoding="utf-8") as fh:
+            return sum(1 for _ in fh)
 
 
 def build_parser() -> argparse.ArgumentParser:
