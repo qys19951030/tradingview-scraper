@@ -39,6 +39,20 @@ DEFAULT_CACHE_TTL_SECONDS = 30 * 60
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_PAGE_ATTEMPTS = 5
 
+STRING_COLUMNS = frozenset({
+    "name", "description", "exchange", "sector", "industry", "currency",
+    "country", "type", "subtype", "logoid", "update_mode", "base_currency_id",
+    "primary_listing", "ticker",
+})
+
+NUMERIC_COLUMNS = frozenset({
+    "close", "open", "high", "low", "change", "change_abs", "volume",
+    "market_cap_basic", "market_cap_calc", "price_earnings_ttm",
+    "earnings_per_share_basic_ttm", "Recommend.All", "Volatility.D",
+    "relative_volume_10d_calc", "price_52_week_high", "price_52_week_low",
+    "average_volume_10d_calc", "Value.Traded", "dividend_yield",
+})
+
 
 class SpecError(ValueError):
     """Raised when the batch spec file is invalid."""
@@ -206,9 +220,11 @@ class BatchCollector:
         seen = self._load_seen_symbols(market) if state["next_offset"] else set()
         offset = state["next_offset"]
         dataset_path = self._part_path(market, "dataset")
+        quarantine_path = self._part_path(market, "quarantine")
         os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
 
-        with open(dataset_path, "a", encoding="utf-8") as dataset_fh:
+        with open(dataset_path, "a", encoding="utf-8") as dataset_fh, \
+                open(quarantine_path, "a", encoding="utf-8") as quarantine_fh:
             while offset < self.spec.max_rows:
                 page_end = min(offset + self.spec.page_size, self.spec.max_rows)
                 payload = self._build_payload(offset, page_end)
@@ -231,18 +247,28 @@ class BatchCollector:
                 for item in rows:
                     state["received"] += 1
                     symbol = item.get("s") or ""
+                    values = item.get("d") or []
+                    if not symbol:
+                        self._quarantine(
+                            quarantine_fh, state, market, symbol, "empty_symbol"
+                        )
+                        continue
                     if symbol in seen:
                         state["skipped"] += 1
                         continue
                     seen.add(symbol)
                     new_symbols += 1
+                    reason = self._validate_row(values)
+                    if reason is not None:
+                        self._quarantine(quarantine_fh, state, market, symbol, reason)
+                        continue
                     record = {"market": market, "symbol": symbol}
-                    values = item.get("d") or []
                     for idx, column in enumerate(self.spec.columns):
                         record[column] = values[idx] if idx < len(values) else None
                     dataset_fh.write(json.dumps(record) + "\n")
                     state["written"] += 1
                 dataset_fh.flush()
+                quarantine_fh.flush()
 
                 offset = page_end
                 state["next_offset"] = offset
@@ -266,6 +292,28 @@ class BatchCollector:
         if self.spec.filters:
             payload["filter"] = self.spec.filters
         return payload
+
+    def _validate_row(self, values: List[Any]) -> Optional[str]:
+        """Return a quarantine reason for a row, or None when it is valid."""
+        if len(values) < len(self.spec.columns):
+            return "missing_columns"
+        for column, value in zip(self.spec.columns, values):
+            if value is None:
+                continue
+            if column in STRING_COLUMNS and not isinstance(value, str):
+                return f"type_mismatch:{column}"
+            if column in NUMERIC_COLUMNS and (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+            ):
+                return f"type_mismatch:{column}"
+        return None
+
+    @staticmethod
+    def _quarantine(fh, state: Dict[str, Any], market: str,
+                    symbol: str, reason: str) -> None:
+        record = {"market": market, "symbol": symbol, "reason": reason}
+        fh.write(json.dumps(record) + "\n")
+        state["quarantined"] += 1
 
     def _fetch_page(self, market: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Fetch a single page with retries; raises PageFetchError on exhaustion."""

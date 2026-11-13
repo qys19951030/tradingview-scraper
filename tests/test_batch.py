@@ -518,6 +518,95 @@ class TestCheckpoint:
             "NYSE:A", "NYSE:B", "NYSE:C", "NYSE:D", "NYSE:E", "LSE:U",
         ]
 
+
+class TestValidation:
+    def test_bad_rows_quarantined_and_counted(self, tmp_path):
+        transport = FakeTransport()
+        transport.add_page("america", 0, FakeResponse(200, {
+            "data": [
+                {"s": "NYSE:OK", "d": ["Good", 1.0, 0.1, 100, 1e6]},
+                {"s": "", "d": ["NoSymbol", 1.0, 0.1, 100, 1e6]},
+                {"s": "NYSE:SHORT", "d": ["TooFew", 1.0]},
+                {"s": "NYSE:BADTYPE", "d": ["Bad", "not-a-number", 0.1, 100, 1e6]},
+                {"s": "NYSE:BADNAME", "d": [123, 1.0, 0.1, 100, 1e6]},
+                {"s": "NYSE:NULLS", "d": ["Nulls", None, None, None, None]},
+            ],
+            "totalCount": 6,
+        }))
+        transport.add_page("uk", 0, FakeResponse(200, {
+            "data": [{"s": "LSE:U", "d": ["U", 9.0, 0.9, 900, 9e6]}],
+            "totalCount": 1,
+        }))
+
+        rc, out_dir = run_collector(tmp_path, transport, max_rows=10, page_size=10)
+        assert rc == 0
+
+        dataset = read_jsonl(os.path.join(out_dir, "dataset.jsonl"))
+        assert [r["symbol"] for r in dataset] == ["NYSE:OK", "NYSE:NULLS", "LSE:U"]
+
+        quarantine = read_jsonl(os.path.join(out_dir, "quarantine.jsonl"))
+        reasons = {r["symbol"]: r["reason"] for r in quarantine}
+        assert reasons == {
+            "": "empty_symbol",
+            "NYSE:SHORT": "missing_columns",
+            "NYSE:BADTYPE": "type_mismatch:close",
+            "NYSE:BADNAME": "type_mismatch:name",
+        }
+        assert all(r["market"] == "america" for r in quarantine)
+
+        manifest = json.loads(
+            open(os.path.join(out_dir, "manifest.json"), encoding="utf-8").read()
+        )
+        america = manifest["markets"]["america"]
+        assert america["received"] == 6
+        assert america["written"] == 2
+        assert america["quarantined"] == 4
+        assert america["skipped"] == 0
+        assert (
+            america["written"] + america["quarantined"] + america["skipped"]
+            == america["received"]
+        )
+
+    def test_quarantined_symbol_blocks_later_duplicate(self, tmp_path):
+        transport = FakeTransport()
+        transport.add_page("america", 0, FakeResponse(200, {
+            "data": [
+                {"s": "NYSE:DUP", "d": ["short"]},
+                {"s": "NYSE:DUP", "d": ["Dup", 1.0, 0.1, 100, 1e6]},
+            ],
+            "totalCount": 2,
+        }))
+        transport.add_page("uk", 0, FakeResponse(200, {
+            "data": [{"s": "LSE:U", "d": ["U", 9.0, 0.9, 900, 9e6]}],
+            "totalCount": 1,
+        }))
+
+        rc, out_dir = run_collector(tmp_path, transport, max_rows=10, page_size=10)
+        assert rc == 0
+        manifest = json.loads(
+            open(os.path.join(out_dir, "manifest.json"), encoding="utf-8").read()
+        )
+        america = manifest["markets"]["america"]
+        assert america["quarantined"] == 1
+        assert america["skipped"] == 1
+        assert america["written"] == 0
+
+    def test_bool_is_not_numeric(self, tmp_path):
+        transport = FakeTransport()
+        transport.add_page("america", 0, FakeResponse(200, {
+            "data": [{"s": "NYSE:B", "d": ["B", True, 0.1, 100, 1e6]}],
+            "totalCount": 1,
+        }))
+        transport.add_page("uk", 0, FakeResponse(200, {
+            "data": [{"s": "LSE:U", "d": ["U", 9.0, 0.9, 900, 9e6]}],
+            "totalCount": 1,
+        }))
+
+        rc, out_dir = run_collector(tmp_path, transport, max_rows=10, page_size=10)
+        assert rc == 0
+        quarantine = read_jsonl(os.path.join(out_dir, "quarantine.jsonl"))
+        assert [r["reason"] for r in quarantine] == ["type_mismatch:close"]
+
     def test_expired_cache_refetches(self, tmp_path):
         transport = FakeTransport()
         transport.add_page("america", 0, FakeResponse(200, make_rows(["S1"])))
