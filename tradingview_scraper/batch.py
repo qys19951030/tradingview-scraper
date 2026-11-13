@@ -14,6 +14,7 @@ The spec file is JSON with the following keys:
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -127,6 +128,7 @@ class BatchCollector:
         fresh: bool = False,
         transport_fn: Optional[Callable] = None,
         sleep_fn: Callable[[float], None] = time.sleep,
+        cache_ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS,
     ):
         self.spec = spec
         self.out_dir = out_dir
@@ -134,6 +136,7 @@ class BatchCollector:
         self.fresh = fresh
         self.transport_fn = transport_fn or http_transport.post
         self.sleep_fn = sleep_fn
+        self.cache_ttl_seconds = cache_ttl_seconds
         self.headers = {"User-Agent": generate_user_agent()}
 
     def run(self) -> int:
@@ -231,6 +234,11 @@ class BatchCollector:
     def _fetch_page(self, market: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Fetch a single page with retries; raises PageFetchError on exhaustion."""
         url = Screener.SUPPORTED_MARKETS[market]
+        cache_key = self._cache_key(market, payload)
+        cached = self._cache_read(cache_key)
+        if cached is not None:
+            logger.debug("cache hit for %s %s", market, payload["range"])
+            return cached
         last_error = "unknown error"
         for attempt in range(MAX_PAGE_ATTEMPTS):
             try:
@@ -249,11 +257,13 @@ class BatchCollector:
             status = response.status_code
             if status == 200:
                 try:
-                    return response.json()
+                    body = response.json()
                 except ValueError as exc:
                     last_error = f"invalid JSON response: {exc}"
                     self._backoff(attempt)
                     continue
+                self._cache_write(cache_key, body)
+                return body
             if status == 429:
                 last_error = "HTTP 429 (rate limited)"
                 retry_after = response.headers.get("Retry-After")
@@ -277,6 +287,35 @@ class BatchCollector:
         if wait is None:
             wait = min(2 ** attempt, 8)
         self.sleep_fn(wait)
+
+    @staticmethod
+    def _cache_key(market: str, payload: Dict[str, Any]) -> str:
+        raw = market + "\n" + json.dumps(payload, sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _cache_path(self, key: str) -> str:
+        return os.path.join(self.out_dir, "cache", f"{key}.json")
+
+    def _cache_read(self, key: str) -> Optional[Dict[str, Any]]:
+        if self.refresh:
+            return None
+        path = self._cache_path(key)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                entry = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        fetched_at = entry.get("fetched_at", 0)
+        if time.time() - fetched_at > self.cache_ttl_seconds:
+            return None
+        return entry.get("response")
+
+    def _cache_write(self, key: str, body: Dict[str, Any]) -> None:
+        path = self._cache_path(key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        entry = {"fetched_at": time.time(), "response": body}
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(entry, fh)
 
     def _write_manifest(self, results: Dict[str, Dict[str, Any]]) -> None:
         manifest = {"markets": results}

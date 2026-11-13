@@ -351,3 +351,75 @@ class TestCollection:
         rc, out_dir = run_collector(tmp_path, flaky_transport, max_rows=5)
         assert rc == 0
         assert len(calls) == 3
+
+
+class TestCache:
+    def test_cache_hit_skips_request(self, tmp_path):
+        transport = FakeTransport()
+        transport.add_page("america", 0, FakeResponse(200, make_rows(["S1"])))
+        transport.add_page("uk", 0, FakeResponse(200, make_rows(["U1"])))
+
+        out_dir = str(tmp_path / "out")
+        spec = BatchSpec.from_dict(make_spec_dict(max_rows=5))
+        rc = BatchCollector(
+            spec=spec, out_dir=out_dir, transport_fn=transport, sleep_fn=lambda _: None
+        ).run()
+        assert rc == 0
+        assert len(transport.calls) == 2
+        assert os.path.isdir(os.path.join(out_dir, "cache"))
+
+        def fail_transport(url, json=None, headers=None, timeout=None):
+            raise AssertionError("transport must not be called on cache hit")
+
+        os.remove(os.path.join(out_dir, "dataset.jsonl"))
+        rc = BatchCollector(
+            spec=spec, out_dir=out_dir, transport_fn=fail_transport, sleep_fn=lambda _: None
+        ).run()
+        assert rc == 0
+        dataset = read_jsonl(os.path.join(out_dir, "dataset.jsonl"))
+        assert [r["symbol"] for r in dataset] == ["S1", "U1"]
+
+    def test_refresh_bypasses_cache(self, tmp_path):
+        transport = FakeTransport()
+        transport.add_page("america", 0, FakeResponse(200, make_rows(["S1"])))
+        transport.add_page("america", 0, FakeResponse(200, make_rows(["S1"])))
+        transport.add_page("uk", 0, FakeResponse(200, make_rows(["U1"])))
+        transport.add_page("uk", 0, FakeResponse(200, make_rows(["U1"])))
+
+        out_dir = str(tmp_path / "out")
+        spec = BatchSpec.from_dict(make_spec_dict(max_rows=5))
+        rc = BatchCollector(
+            spec=spec, out_dir=out_dir, transport_fn=transport, sleep_fn=lambda _: None
+        ).run()
+        assert rc == 0
+
+        os.remove(os.path.join(out_dir, "dataset.jsonl"))
+        rc = BatchCollector(
+            spec=spec, out_dir=out_dir, refresh=True,
+            transport_fn=transport, sleep_fn=lambda _: None,
+        ).run()
+        assert rc == 0
+        assert len(transport.calls) == 4
+
+    def test_expired_cache_refetches(self, tmp_path):
+        transport = FakeTransport()
+        transport.add_page("america", 0, FakeResponse(200, make_rows(["S1"])))
+        transport.add_page("america", 0, FakeResponse(200, make_rows(["S1"])))
+        transport.add_page("uk", 0, FakeResponse(200, make_rows(["U1"])))
+        transport.add_page("uk", 0, FakeResponse(200, make_rows(["U1"])))
+
+        out_dir = str(tmp_path / "out")
+        spec = BatchSpec.from_dict(make_spec_dict(max_rows=5))
+        rc = BatchCollector(
+            spec=spec, out_dir=out_dir, transport_fn=transport,
+            sleep_fn=lambda _: None, cache_ttl_seconds=0,
+        ).run()
+        assert rc == 0
+
+        os.remove(os.path.join(out_dir, "dataset.jsonl"))
+        rc = BatchCollector(
+            spec=spec, out_dir=out_dir, transport_fn=transport,
+            sleep_fn=lambda _: None, cache_ttl_seconds=0,
+        ).run()
+        assert rc == 0
+        assert len(transport.calls) == 4
