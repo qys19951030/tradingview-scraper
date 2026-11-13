@@ -1,0 +1,8 @@
+{
+  "markets": ["america", "uk", "crypto"],
+  "columns": ["name", "close", "change", "volume", "market_cap_basic"],
+  "filters": [],
+  "page_size": 100,
+  "max_rows": 1000,
+  "requests_per_second": 1.0
+}

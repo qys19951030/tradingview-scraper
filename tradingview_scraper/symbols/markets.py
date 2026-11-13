@@ -4,6 +4,7 @@ from typing import List, Optional, Dict
 
 import requests
 
+from tradingview_scraper.symbols import http_transport
 from tradingview_scraper.symbols.utils import (
     save_csv_file,
     save_json_file,
@@ -222,7 +223,7 @@ class Markets:
 
         try:
             # Make request
-            response = requests.post(
+            response = http_transport.post(
                 url,
                 json=payload,
                 headers=self.headers,
